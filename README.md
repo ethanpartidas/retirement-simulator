@@ -1,4 +1,4 @@
-# retirement-sim
+# retirement-simulator
 
 A dynamic-programming Monte Carlo retirement portfolio optimiser.
 
@@ -22,8 +22,8 @@ resulting policy.
 ### 1. Clone
 
 ```bash
-git clone https://github.com/your-username/retirement-sim.git
-cd retirement-sim
+git https://github.com/ethanpartidas/retirement-simulator.git
+cd retirement-simulator
 ```
 
 ### 2. Create a virtual environment

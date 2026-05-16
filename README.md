@@ -22,7 +22,7 @@ resulting policy.
 ### 1. Clone
 
 ```bash
-git https://github.com/ethanpartidas/retirement-simulator.git
+git clone https://github.com/ethanpartidas/retirement-simulator.git
 cd retirement-simulator
 ```
 

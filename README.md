@@ -49,13 +49,13 @@ All parameters live in `config.toml`.  The key knobs are:
 
 ```toml
 [person]
-current_age = 24
+current_age = 25
 end_age     = 95
-current_nw  = 163_500
+current_nw  = 150_000
 
 [cashflow]
-monthly_savings_today  = 1_000   # pre-retirement monthly savings (today's $)
-retirement_spend_today = 5_300   # monthly spend in retirement (today's $)
+monthly_savings_today  = 4_000   # pre-retirement monthly savings (today's $)
+retirement_spend_today = 4_000   # monthly spend in retirement (today's $)
 
 [market]
 stock_mu_nom        = 0.10    # expected nominal stock return

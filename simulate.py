@@ -181,46 +181,81 @@ def _backward_earliest(
 @njit(cache=True)
 def _backward_max_wealth(
     nw_grid, ages, actions, quantiles, z_scores, outcome_percentiles,
-    dist_grid, optimal_policy,
+    dist_grid, optimal_policy, mult_grid,
     monthly_savings_today,
     stock_mu_nom, stock_vol, bond_mu_nom, bond_vol,
     inflation_rate, target_percentile, max_nw,
     fixed_retirement_age,
 ):
     """
-    dist_grid stores predicted nominal net worth at fixed_retirement_age.
+    Unified DP for max_wealth mode.
 
-    Terminal condition: at fixed_retirement_age the nominal NW *is* the grid
-    value, so dist_grid at that age is set to nw_grid values during setup.
+    dist_grid stores absolute predicted terminal NW for nodes within the grid.
+    mult_grid  stores wealth-independent growth multipliers (age-only, no NW dim).
 
-    After fixed_retirement_age, dist_grid is unused (forward sim handles
-    decumulation separately).
+    During fan-out, next_nw values that exceed max_nw are evaluated using the
+    multiplier from mult_grid rather than extrapolating from the grid edge,
+    eliminating the cap artifact without any pre-set NW threshold.
 
-    Optimisation target: *maximise* the target_percentile of the nominal-wealth
-    distribution.
+    Both grids run the same backward pass; mult_grid is always available for
+    any out-of-bounds next_nw regardless of which NW bucket we're in.
     """
     num_quantiles = len(quantiles)
 
-    # Find the index of fixed_retirement_age in ages
     ret_a_idx = -1
     for i in range(len(ages)):
         if ages[i] == fixed_retirement_age:
             ret_a_idx = i
             break
 
-    # Backward from one year before retirement to current_age
+    # Terminal conditions
+    for nw_idx in range(len(nw_grid)):
+        for q in range(num_quantiles):
+            dist_grid[ret_a_idx, nw_idx, q] = nw_grid[nw_idx]
+    for q in range(num_quantiles):
+        mult_grid[ret_a_idx, q] = 1.0
+
     for a_idx in range(ret_a_idx - 1, -1, -1):
-        age = ages[a_idx]
         inf_factor = (1 + inflation_rate) ** a_idx
         yr_savings = monthly_savings_today * 12 * inf_factor
 
         next_dist = dist_grid[a_idx + 1]   # shape (nw_buckets, Q)
+        next_mult = mult_grid[a_idx + 1]   # shape (Q,)
 
+        # ── High-NW multiplier DP (age-only, no savings) ──────────────────
+        best_hi_action = 0.0
+        best_hi_metric  = -1e18
+        best_hi_dist   = np.zeros(num_quantiles)
+
+        for alloc in actions:
+            mu  = alloc * stock_mu_nom + (1 - alloc) * bond_mu_nom
+            vol = np.sqrt((alloc * stock_vol) ** 2 + ((1 - alloc) * bond_vol) ** 2)
+            one_yr_mults = 1.0 + mu + z_scores * vol
+
+            mat = np.empty((num_quantiles, num_quantiles))
+            for q_idx in range(num_quantiles):
+                for j in range(num_quantiles):
+                    mat[j, q_idx] = one_yr_mults[j] * next_mult[q_idx]
+
+            all_out = mat.flatten()
+            all_out.sort()
+
+            metric = np.interp(target_percentile, outcome_percentiles, all_out)\
+
+            if metric > best_hi_metric:
+                best_hi_metric  = metric
+                best_hi_action = alloc
+                best_hi_dist   = np.interp(quantiles, outcome_percentiles, all_out)
+
+        for q in range(num_quantiles):
+            mult_grid[a_idx, q] = best_hi_dist[q]
+
+        # ── Full grid DP (all NW buckets, with savings) ───────────────────
         for nw_idx in range(len(nw_grid)):
             nw = nw_grid[nw_idx]
 
             best_action = 0.0
-            best_score  = -1e18             # maximising
+            best_metric  = -1e18
             best_dist   = np.zeros(num_quantiles)
 
             for alloc in actions:
@@ -228,32 +263,26 @@ def _backward_max_wealth(
                 vol = np.sqrt((alloc * stock_vol) ** 2 + ((1 - alloc) * bond_vol) ** 2)
 
                 next_nws = (nw + yr_savings) * (1 + mu + z_scores * vol)
-                # clip to grid
-                next_nws_c = np.empty(num_quantiles)
-                for j in range(num_quantiles):
-                    v = next_nws[j]
-                    next_nws_c[j] = v if v >= 0 else 0.0
 
                 mat = np.empty((num_quantiles, num_quantiles))
                 for q_idx in range(num_quantiles):
-                    interp = np.interp(next_nws_c, nw_grid, next_dist[:, q_idx])
                     for j in range(num_quantiles):
-                        mat[j, q_idx] = interp[j]
+                        nw_next = next_nws[j]
+                        if nw_next <= 0.0:
+                            mat[j, q_idx] = 0.0
+                        elif nw_next > max_nw:
+                            # Use multiplier DP: next_nw * future_multiplier
+                            mat[j, q_idx] = nw_next * next_mult[q_idx]
+                        else:
+                            mat[j, q_idx] = np.interp(nw_next, nw_grid, next_dist[:, q_idx])
 
                 all_out = mat.flatten()
                 all_out.sort()
 
-                # Maximise the target percentile of nominal retirement wealth.
-                # We negate so "lower score is better" logic still works.
                 metric = np.interp(target_percentile, outcome_percentiles, all_out)
 
-                # tie-breaker: also improve the lower tail (floor)
-                lo_idx = min(int((1 - target_percentile) * num_quantiles), num_quantiles - 1)
-                floor  = np.sort(all_out)[lo_idx]
-                score  = metric + 0.0001 * (floor / max_nw)   # higher = better
-
-                if score > best_score:
-                    best_score  = score
+                if metric > best_metric:
+                    best_metric  = metric
                     best_action = alloc
                     best_dist   = np.interp(quantiles, outcome_percentiles, all_out)
 
@@ -261,7 +290,7 @@ def _backward_max_wealth(
             for q in range(num_quantiles):
                 dist_grid[a_idx, nw_idx, q] = best_dist[q]
 
-    return dist_grid, optimal_policy
+    return dist_grid, optimal_policy, mult_grid
 
 
 # ── Top-level simulation ──────────────────────────────────────────────────────
@@ -308,21 +337,18 @@ def run_simulation(p: dict):
                 f"fixed_retirement_age={fixed_ret_age} is outside "
                 f"[{ages[0]}, {ages[-1]}]"
             )
-        dist_grid = np.zeros((len(ages), num_nw_buckets, num_quantiles))
 
-        # Terminal: at retirement age, nominal NW is the grid value directly.
-        ret_a_idx = int(fixed_ret_age - p["current_age"])
-        for nw_idx, nw in enumerate(nw_grid):
-            dist_grid[ret_a_idx, nw_idx, :] = nw
+        dist_grid = np.zeros((len(ages), num_nw_buckets, num_quantiles))
+        mult_grid = np.zeros((len(ages), num_quantiles))
 
         print(
             f"[Mode: max_wealth] target retirement age {fixed_ret_age}, "
             f"{num_quantiles} quantiles, P{target_pct*100:.0f} target"
         )
         t0 = time.perf_counter()
-        dist_grid, optimal_policy = _backward_max_wealth(
+        dist_grid, optimal_policy, mult_grid = _backward_max_wealth(
             nw_grid, ages, actions, quantiles, z_scores, outcome_percentiles,
-            dist_grid, optimal_policy,
+            dist_grid, optimal_policy, mult_grid,
             p["monthly_savings_today"],
             p["stock_mu_nom"], p["stock_vol"], p["bond_mu_nom"], p["bond_vol"],
             p["inflation_rate"], target_pct, max_nw,
@@ -404,12 +430,13 @@ def run_simulation(p: dict):
         optimal_policy,
         dist_grid,
         mode,
+        nw_grid,
     )
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, p):
+def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, p, nw_grid):
     target_pct = p["target_percentile"]
     fig, axes  = plt.subplots(1, 3, figsize=(20, 6))
     ax1, ax2, ax3 = axes
@@ -475,10 +502,19 @@ def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, 
                     label=f"Target retirement age {p['fixed_retirement_age']}")
         ax1.legend(fontsize=8)
 
+        # Build display layer: pre-retirement = DP quantile, post-retirement = nw_grid value
+        ret_a_idx   = int(p["fixed_retirement_age"]) - int(timeline[0])
+        display_layer = dist_matrix[:, :, q_idx].copy()   # shape (ages, nw_buckets)
+        for a_idx in range(ret_a_idx, len(timeline)):
+            for nw_idx in range(display_layer.shape[1]):
+                display_layer[a_idx, nw_idx] = nw_grid[nw_idx]
+
         im3 = ax3.imshow(
-            dist_matrix[:, :, q_idx].T, aspect="auto", origin="lower",
+            display_layer.T, aspect="auto", origin="lower",
             extent=[timeline[0], timeline[-1], 0, 10_000_000], cmap="RdYlGn",
+            vmin=0, vmax=10_000_000,
         )
+        ax3.axvline(p["fixed_retirement_age"], color="orange", lw=1, ls="--")
         ax3.set_title(f"Predicted P{target_pct*100:.0f} Nominal Wealth at Retirement")
         ax3.set_xlabel("Age")
         fig.colorbar(im3, ax=ax3, label="Nominal net worth ($)")
@@ -514,11 +550,11 @@ def main():
     params = resolve_params(flatten_config(cfg))
 
     (paths, ret_ages, ret_nws,
-     timeline, policy, dist_matrix, mode) = run_simulation(params)
+     timeline, policy, dist_matrix, mode, nw_grid) = run_simulation(params)
 
     plot_results(
         paths, ret_ages, ret_nws,
-        timeline, policy, dist_matrix, mode, params
+        timeline, policy, dist_matrix, mode, params, nw_grid
     )
 
 

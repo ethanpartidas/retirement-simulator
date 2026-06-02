@@ -7,7 +7,11 @@ current_nw  = 150_000
 
 [cashflow]
 monthly_savings_today  = 4_000
+semi_retirement_monthly_cashflow_today = 1_000
 retirement_spend_today = 4_000
+kids_start_age             = 30
+kids_end_age               = 48
+kids_monthly_expense_today = 2_000
 
 [market]
 stock_mu_nom   = 0.10
@@ -15,29 +19,35 @@ stock_vol      = 0.15
 bond_mu_nom    = 0.045
 bond_vol       = 0.05
 inflation_rate = 0.03
-
-# Post-retirement bond volatility.
-# Use a lower value (e.g. 0.01) to model a bond ladder / annuity floor.
-# Defaults to bond_vol if omitted.
 retirement_bond_vol = 0.01
 
 [simulation]
 iterations        = 10_000
-target_percentile = 0.95
+age_percentile    = 0.95
+wealth_percentile = 0.05
 num_quantiles     = 50
+fixed_retirement_age = 65
 
 # ── Mode ────────────────────────────────────────────────────────────────────
 # "earliest_retirement"
-#     Optimize allocation to retire as early as possible at the target
-#     percentile.  The DP stores the predicted retirement age at each
-#     (age, wealth) state.
+#      Optimize allocation to retire as early as possible at the target
+#      percentile.  The DP stores the predicted retirement age at each
+#      (age, wealth) state.
 #
 # "max_wealth"
-#     Assume a fixed retirement age and optimize allocation to maximise
-#     inflation-adjusted net worth at that age.  The DP stores predicted
-#     wealth (in today's dollars) at each (age, wealth) state.
+#      Assume a fixed retirement age and optimize allocation to maximise
+#      nominal net worth at that age.  The DP stores predicted wealth at
+#      each (age, wealth) state.
+#
+# "semi_retirement"
+#      Fix a full retirement age (fixed_retirement_age) and find the
+#      earliest age to enter semi-retirement such that full retirement
+#      is still achievable at that age at the target percentile.
+#      Semi-retirement cash flow is set by semi_retirement_monthly_cashflow.
+#      Two-phase DP:
+#         Phase B — from semi-retirement onward: optimizes allocation using
+#                  the semi cash flow, targeting the full-retirement threshold.
+#         Phase A — accumulation: finds the earliest age at which entering
+#                  semi-retirement still guarantees Phase B succeeds.
 # ────────────────────────────────────────────────────────────────────────────
 mode = "earliest_retirement"
-
-# Only used when mode = "max_wealth":
-fixed_retirement_age = 55

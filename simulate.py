@@ -815,11 +815,22 @@ def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, 
     ax1.legend(fontsize=8)
 
     # Panel 2: policy heatmap
+    if mode == "semi_retirement" and extra is not None:
+        display_policy = np.where(
+            nw_grid >= extra["w_semi"][:, None],
+            extra["optimal_policy_semi"],
+            policy
+        )
+        title = "Optimal Stock Allocation (Mixed)"
+    else:
+        display_policy = policy
+        title = "Optimal Stock Allocation (Accumulation)"
+
     im2 = ax2.imshow(
-        policy.T, aspect="auto", origin="lower",
+        display_policy.T, aspect="auto", origin="lower",
         extent=[timeline[0], timeline[-1], 0, 10_000_000], cmap="RdYlGn",
     )
-    ax2.set_title("Optimal Stock Allocation (Accumulation)")
+    ax2.set_title(title)
     ax2.set_xlabel("Age")
     fig.colorbar(im2, ax=ax2, label="Stock weight")
 
@@ -856,7 +867,7 @@ def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, 
         
         med_nw = np.median(ret_nws[ret_nws > 0])
         p_lo   = np.percentile(ret_nws[ret_nws > 0], target_pct * 100)
-        p_hi   = np.percentile(ret_nws[ret_nws > 0], (1 - target_pct) * 100) # Inverted for reporting top tail usually
+        p_hi   = np.percentile(ret_nws[ret_nws > 0], (1 - target_pct) * 100)
 
         ax1.axvline(p["fixed_retirement_age"], color="orange", lw=2, ls="--",
                     label=f"Target retirement age {p['fixed_retirement_age']}")
@@ -922,7 +933,6 @@ def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, 
     print(f"\n{summary}")
     print(f"Plot saved to {out_path}")
     plt.show()
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

@@ -70,6 +70,9 @@ def resolve_params(flat: dict) -> dict:
     flat.setdefault("mode", "earliest_retirement")
     flat.setdefault("fixed_retirement_age", flat["end_age"])
     flat.setdefault("semi_retirement_monthly_cashflow_today", 0.0)
+    flat.setdefault("kids_start_age", 0)
+    flat.setdefault("kids_end_age", 0)
+    flat.setdefault("kids_monthly_expense_today", 0.0)
     return flat
 
 
@@ -112,6 +115,7 @@ def _backward_earliest(
     monthly_savings_today, retirement_spend_today,
     stock_mu_nom, stock_vol, bond_mu_nom, bond_vol,
     inflation_rate, target_percentile, max_nw,
+    kids_start_age, kids_end_age, kids_monthly_expense_today
 ):
     num_quantiles = len(quantiles)
 
@@ -121,13 +125,20 @@ def _backward_earliest(
 
         inf_factor = (1 + inflation_rate) ** a_idx
         yr_savings = monthly_savings_today * 12 * inf_factor
-        yr_spend   = retirement_spend_today * 12 * inf_factor
+        
+        if kids_start_age <= age < kids_end_age:
+            yr_savings -= kids_monthly_expense_today * 12 * inf_factor
 
         nominal_floor = 0.0
         for k in range(years_to_end):
-            nominal_floor += (
-                yr_spend * (1 + inflation_rate) ** k / (1 + bond_mu_nom) ** k
-            )
+            fut_age = age + k
+            yr_inf = (1 + inflation_rate) ** (a_idx + k)
+            yr_disc = (1 + bond_mu_nom) ** k
+            base_spend = retirement_spend_today * 12
+            kids_exp = kids_monthly_expense_today * 12 if (kids_start_age <= fut_age < kids_end_age) else 0.0
+            total_spend = base_spend + kids_exp
+            nominal_floor += (total_spend * yr_inf) / yr_disc
+            
         target_goal = nominal_floor * 1.1
 
         next_dist = dist_grid[a_idx + 1]   # shape (nw_buckets, Q)
@@ -198,20 +209,8 @@ def _backward_max_wealth(
     stock_mu_nom, stock_vol, bond_mu_nom, bond_vol,
     inflation_rate, target_percentile, max_nw,
     fixed_retirement_age,
+    kids_start_age, kids_end_age, kids_monthly_expense_today
 ):
-    """
-    Unified DP for max_wealth mode.
-
-    dist_grid stores absolute predicted terminal NW for nodes within the grid.
-    mult_grid  stores wealth-independent growth multipliers (age-only, no NW dim).
-
-    During fan-out, next_nw values that exceed max_nw are evaluated using the
-    multiplier from mult_grid rather than extrapolating from the grid edge,
-    eliminating the cap artifact without any pre-set NW threshold.
-
-    Both grids run the same backward pass; mult_grid is always available for
-    any out-of-bounds next_nw regardless of which NW bucket we're in.
-    """
     num_quantiles = len(quantiles)
 
     ret_a_idx = -1
@@ -228,8 +227,12 @@ def _backward_max_wealth(
         mult_grid[ret_a_idx, q] = 1.0
 
     for a_idx in range(ret_a_idx - 1, -1, -1):
+        age = ages[a_idx]
         inf_factor = (1 + inflation_rate) ** a_idx
         yr_savings = monthly_savings_today * 12 * inf_factor
+        
+        if kids_start_age <= age < kids_end_age:
+            yr_savings -= kids_monthly_expense_today * 12 * inf_factor
 
         next_dist = dist_grid[a_idx + 1]   # shape (nw_buckets, Q)
         next_mult = mult_grid[a_idx + 1]   # shape (Q,)
@@ -252,7 +255,7 @@ def _backward_max_wealth(
             all_out = mat.flatten()
             all_out.sort()
 
-            metric = np.interp(target_percentile, outcome_percentiles, all_out)\
+            metric = np.interp(target_percentile, outcome_percentiles, all_out)
 
             if metric > best_hi_metric:
                 best_hi_metric  = metric
@@ -316,28 +319,10 @@ def precompute_w_semi(
     semi_retirement_monthly_cashflow_today,
     bond_mu_nom,
     inflation_rate,
+    kids_start_age,
+    kids_end_age,
+    kids_monthly_expense_today
 ):
-    """
-    Precompute the semi-retirement wealth threshold for every age in `ages`.
-
-    For each candidate semi-retirement age s (s_idx years from current_age),
-    w_semi[s] is the NW needed AT age s to fund all future cashflows:
-
-      k = 0 .. (fixed_retirement_age - s - 1)  : semi-retirement years
-          annual_cf = semi_retirement_monthly_cashflow_today * 12 * (1+inf)^(s_idx+k)
-          (positive = net income, negative = net expense)
-
-      k = (fixed_retirement_age - s) .. (end_age - s - 1)  : full retirement years
-          annual_cf = -retirement_spend_today * 12 * (1+inf)^(s_idx+k)
-          (always an outflow)
-
-    All cashflows inflated from current_age (factor (1+inf)^(s_idx+k)).
-    All discounted back to age s (factor (1+bond_mu_nom)^k, where k is years from s).
-
-    w_semi[s] = -pv_total * 1.1   (flip sign: we need this NW to cover net outflows)
-
-    Ages at or beyond fixed_retirement_age get w_semi = 0.
-    """
     w_semi = np.zeros(len(ages))
 
     for a_idx, age in enumerate(ages):
@@ -345,12 +330,13 @@ def precompute_w_semi(
             w_semi[a_idx] = 0.0
             continue
 
-        s_idx         = int(age - current_age)   # years from current_age to age s
-        years_to_end  = end_age - int(age)        # total years to simulate from s
+        s_idx         = int(age - current_age)   
+        years_to_end  = end_age - int(age)        
         years_semi    = fixed_retirement_age - int(age)
 
         pv_total = 0.0
         for k in range(years_to_end):
+            fut_age = int(age) + k
             yr_inflation = (1 + inflation_rate) ** (s_idx + k)
             yr_discount  = (1 + bond_mu_nom)    ** k
 
@@ -358,6 +344,9 @@ def precompute_w_semi(
                 annual_cf = semi_retirement_monthly_cashflow_today * 12 * yr_inflation
             else:
                 annual_cf = -retirement_spend_today * 12 * yr_inflation
+                
+            if kids_start_age <= fut_age < kids_end_age:
+                annual_cf -= kids_monthly_expense_today * 12 * yr_inflation
 
             pv_total += annual_cf / yr_discount
 
@@ -376,17 +365,8 @@ def _backward_semi(
     stock_mu_nom, stock_vol, bond_mu_nom, bond_vol,
     inflation_rate, target_percentile, max_nw,
     w_semi,
+    kids_start_age, kids_end_age, kids_monthly_expense_today
 ):
-    """
-    Backward induction for semi_retirement mode.
-
-    Identical in structure to _backward_earliest, but the per-age goal threshold
-    comes from the precomputed w_semi array rather than being computed inline
-    from retirement_spend_today.
-
-    When a cell's nw >= w_semi[a_idx], every quantile for that cell is set to
-    the current age (semi-retirement achieved), exactly mirroring earliest_retirement.
-    """
     num_quantiles = len(quantiles)
 
     for a_idx in range(len(ages) - 2, -1, -1):
@@ -394,6 +374,9 @@ def _backward_semi(
 
         inf_factor = (1 + inflation_rate) ** a_idx
         yr_savings = monthly_savings_today * 12 * inf_factor
+        
+        if kids_start_age <= age < kids_end_age:
+            yr_savings -= kids_monthly_expense_today * 12 * inf_factor
 
         target_goal = w_semi[a_idx]
 
@@ -420,9 +403,6 @@ def _backward_semi(
 
                 next_nws = (nw + yr_savings) * (1 + mu + z_scores * vol)
 
-                # next_dist at a_idx+1: if a_idx+1 is at or past fixed_retirement_age,
-                # target_goal for that node is 0, so those nodes are already marked
-                # with their age. The interp will correctly read those values.
                 mat = np.empty((num_quantiles, num_quantiles))
                 for q_idx in range(num_quantiles):
                     interp = np.interp(next_nws, nw_grid, next_dist[:, q_idx])
@@ -473,6 +453,10 @@ def run_simulation(p: dict):
     mode                  = p["mode"]
     fixed_ret_age         = int(p["fixed_retirement_age"])
     ret_bond_vol          = p["retirement_bond_vol"]
+    
+    k_start = int(p["kids_start_age"])
+    k_end   = int(p["kids_end_age"])
+    k_exp   = float(p["kids_monthly_expense_today"])
 
     quantiles, z_scores, outcome_percentiles = make_grids(num_quantiles)
     optimal_policy = np.zeros((len(ages), num_nw_buckets))
@@ -494,6 +478,7 @@ def run_simulation(p: dict):
             p["monthly_savings_today"], p["retirement_spend_today"],
             p["stock_mu_nom"], p["stock_vol"], p["bond_mu_nom"], p["bond_vol"],
             p["inflation_rate"], target_pct, max_nw,
+            k_start, k_end, k_exp
         )
 
     elif mode == "max_wealth":
@@ -518,6 +503,7 @@ def run_simulation(p: dict):
             p["stock_mu_nom"], p["stock_vol"], p["bond_mu_nom"], p["bond_vol"],
             p["inflation_rate"], target_pct, max_nw,
             fixed_ret_age,
+            k_start, k_end, k_exp
         )
 
     elif mode == "semi_retirement":
@@ -536,6 +522,7 @@ def run_simulation(p: dict):
             p["semi_retirement_monthly_cashflow_today"],
             p["bond_mu_nom"],
             p["inflation_rate"],
+            k_start, k_end, k_exp
         )
 
         print(
@@ -544,11 +531,6 @@ def run_simulation(p: dict):
             f"{num_quantiles} quantiles, P{target_pct*100:.0f} target"
         )
 
-        # Terminal condition: at fixed_retirement_age every node is already
-        # semi-retired (semi_ret happened at or before that age).
-        # We fill from current_age up to fixed_retirement_age; nodes at
-        # fixed_retirement_age get the age value directly (can always semi-retire
-        # by full retirement at the latest).
         dist_grid = np.full((len(ages), num_nw_buckets, num_quantiles), float(fixed_ret_age))
 
         t0 = time.perf_counter()
@@ -559,6 +541,7 @@ def run_simulation(p: dict):
             p["stock_mu_nom"], p["stock_vol"], p["bond_mu_nom"], p["bond_vol"],
             p["inflation_rate"], target_pct, max_nw,
             w_semi,
+            k_start, k_end, k_exp
         )
 
     else:
@@ -577,7 +560,6 @@ def run_simulation(p: dict):
     ret_nws_list  = []
     rng           = np.random.default_rng()
 
-    # Precompute w_semi array for forward sim (only used in semi_retirement mode)
     if mode == "semi_retirement":
         w_semi_fwd = precompute_w_semi(
             ages,
@@ -588,6 +570,7 @@ def run_simulation(p: dict):
             p["semi_retirement_monthly_cashflow_today"],
             p["bond_mu_nom"],
             p["inflation_rate"],
+            k_start, k_end, k_exp
         )
     else:
         w_semi_fwd = None
@@ -595,8 +578,8 @@ def run_simulation(p: dict):
     for i in range(iterations):
         nw      = float(p["current_nw"])
         all_paths[i, 0] = nw
-        ret_age      = None   # semi-retirement age (modes: semi) or full ret age (others)
-        full_ret_age_actual = None  # only used in semi_retirement mode
+        ret_age      = None   
+        full_ret_age_actual = None  
         ret_nw  = None
 
         for year_idx in range(1, total_years + 1):
@@ -607,14 +590,17 @@ def run_simulation(p: dict):
             inf_factor = (1 + p["inflation_rate"]) ** a_idx
             yr_savings = p["monthly_savings_today"] * 12 * inf_factor
             yr_spend   = p["retirement_spend_today"] * 12 * inf_factor
+            kids_exp_yr = p["kids_monthly_expense_today"] * 12 * inf_factor if (k_start <= age < k_end) else 0.0
 
             if mode == "earliest_retirement":
-                nominal_floor = sum(
-                    yr_spend
-                    * (1 + p["inflation_rate"]) ** k
-                    / (1 + p["bond_mu_nom"]) ** k
-                    for k in range(years_to_end)
-                )
+                nominal_floor = 0.0
+                for k in range(years_to_end):
+                    fut_age = age + k
+                    yr_inf = (1 + p["inflation_rate"]) ** (a_idx + k)
+                    yr_disc = (1 + p["bond_mu_nom"]) ** k
+                    base_spend = p["retirement_spend_today"] * 12
+                    k_exp_fut = p["kids_monthly_expense_today"] * 12 if (k_start <= fut_age < k_end) else 0.0
+                    nominal_floor += ((base_spend + k_exp_fut) * yr_inf) / yr_disc
                 target_goal = nominal_floor * 1.1
 
                 if ret_age is None and nw >= target_goal:
@@ -628,11 +614,9 @@ def run_simulation(p: dict):
                     ret_nw  = nw
 
             elif mode == "semi_retirement":
-                # Check semi-retirement trigger
                 if ret_age is None and nw >= w_semi_fwd[a_idx]:
                     ret_age = age
                     ret_nw  = nw
-                # Check full retirement trigger
                 if ret_age is not None and full_ret_age_actual is None and age >= fixed_ret_age:
                     full_ret_age_actual = age
 
@@ -640,45 +624,38 @@ def run_simulation(p: dict):
 
             if mode in ("earliest_retirement", "max_wealth"):
                 if ret_age is None:
-                    # Accumulation: follow optimal policy
                     nw_bucket = int(np.argmin(np.abs(nw_grid - nw)))
                     sw  = optimal_policy[a_idx, nw_bucket]
                     bw  = 1.0 - sw
                     mu  = sw * p["stock_mu_nom"] + bw * p["bond_mu_nom"]
                     vol = np.sqrt((sw * p["stock_vol"]) ** 2 + (bw * p["bond_vol"]) ** 2)
                     ret = rng.normal(mu, vol)
-                    nw  = (nw + yr_savings) * (1 + ret)
+                    nw  = (nw + yr_savings - kids_exp_yr) * (1 + ret)
                 else:
-                    # Decumulation: 100% bonds
                     ret = rng.normal(p["bond_mu_nom"], ret_bond_vol)
-                    nw  = (nw - yr_spend) * (1 + ret)
+                    nw  = (nw - yr_spend - kids_exp_yr) * (1 + ret)
 
             elif mode == "semi_retirement":
                 if ret_age is None:
-                    # Accumulation: follow optimal policy
                     nw_bucket = int(np.argmin(np.abs(nw_grid - nw)))
                     sw  = optimal_policy[a_idx, nw_bucket]
                     bw  = 1.0 - sw
                     mu  = sw * p["stock_mu_nom"] + bw * p["bond_mu_nom"]
                     vol = np.sqrt((sw * p["stock_vol"]) ** 2 + (bw * p["bond_vol"]) ** 2)
                     ret = rng.normal(mu, vol)
-                    nw  = (nw + yr_savings) * (1 + ret)
+                    nw  = (nw + yr_savings - kids_exp_yr) * (1 + ret)
 
                 elif full_ret_age_actual is None:
-                    # Semi-retirement: 100% bonds, semi-retirement cashflow
                     semi_cf_annual = p["semi_retirement_monthly_cashflow_today"] * 12 * inf_factor
                     ret = rng.normal(p["bond_mu_nom"], ret_bond_vol)
-                    # positive cashflow = net income (adds to nw before growth)
-                    nw  = (nw + semi_cf_annual) * (1 + ret)
+                    nw  = (nw + semi_cf_annual - kids_exp_yr) * (1 + ret)
 
                 else:
-                    # Full retirement: 100% bonds, spend retirement_spend_today
                     ret = rng.normal(p["bond_mu_nom"], ret_bond_vol)
-                    nw  = (nw - yr_spend) * (1 + ret)
+                    nw  = (nw - yr_spend - kids_exp_yr) * (1 + ret)
 
             all_paths[i, year_idx] = max(0.0, nw)
 
-        # Record retirement ages/nw
         if mode == "semi_retirement":
             ret_ages_list.append(ret_age if ret_age is not None else fixed_ret_age)
         else:
@@ -771,7 +748,6 @@ def plot_results(paths, ret_ages, ret_nws, timeline, policy, dist_matrix, mode, 
                     label=f"Target retirement age {p['fixed_retirement_age']}")
         ax1.legend(fontsize=8)
 
-        # Build display layer: pre-retirement = DP quantile, post-retirement = nw_grid value
         ret_a_idx   = int(p["fixed_retirement_age"]) - int(timeline[0])
         display_layer = dist_matrix[:, :, q_idx].copy()
         for a_idx in range(ret_a_idx, len(timeline)):
